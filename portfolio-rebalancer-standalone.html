@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portfolio Rebalancer</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0d1117; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+
+const DEFAULT_GROUP_RULES = {
+  VTI: 'US Index', VOO: 'US Index',
+  VXUS: 'EX-US Index', VEA: 'EX-US Index', FLJH: 'EX-US Index',
+  BND: 'BOND Index', BSV: 'BOND Index', BNDX: 'BOND Index',
+};
+const GROUPS = ['US Index', 'EX-US Index', 'BOND Index', 'Stocks'];
+const STORAGE_KEY = 'rebalancer2:state';
+
+// Local-dev replacement for the Claude-artifact window.storage API.
+// Same async shape (get/set returning {key, value}), backed by localStorage.
+const storage = {
+  async get(key) {
+    const v = localStorage.getItem(key);
+    return v !== null ? { key, value: v } : null;
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value };
+  },
+};
+
+
+function fmtMoney(v) {
+  const sign = v < 0 ? '-' : '';
+  return sign + '$' + Math.abs(Math.round(v)).toLocaleString();
+}
+function fmtPct(v) { return (isFinite(v) ? v : 0).toFixed(1) + '%'; }
+
+// Cash-flow (buy-only) or full (buy+sell) rebalance across a set of items.
+function calcRebalance(items, totalCurrent, newCash, mode) {
+  const futureTotal = totalCurrent + newCash;
+  const withGaps = items.map(it => {
+    const ideal = (it.targetPct / 100) * futureTotal;
+    return { ...it, ideal, gap: ideal - it.current };
+  });
+
+  if (mode === 'full') {
+    return withGaps.map(it => ({ ...it, action: it.gap }));
+  }
+
+  const positive = withGaps.filter(g => g.gap > 0);
+  const sumPositive = positive.reduce((s, g) => s + g.gap, 0);
+  const cash = Math.max(0, newCash);
+
+  if (sumPositive <= cash) {
+    let out = withGaps.map(it => ({ ...it, action: Math.max(0, it.gap) }));
+    const remainder = cash - sumPositive;
+    if (remainder > 0) {
+      out = out.map(it => ({ ...it, action: it.action + remainder * (it.targetPct / 100) }));
+    }
+    return out;
+  }
+  return withGaps.map(it => {
+    const gapPos = Math.max(0, it.gap);
+    const share = sumPositive > 0 ? cash * (gapPos / sumPositive) : 0;
+    return { ...it, action: share };
+  });
+}
+
+function PortfolioRebalancer() {
+  const [holdings, setHoldings] = useState([]);
+  const [groupOverride, setGroupOverride] = useState({});
+  const [groupTargets, setGroupTargets] = useState({ 'US Index': 0, 'EX-US Index': 0, 'BOND Index': 0, 'Stocks': 0 });
+  const [holdingTargets, setHoldingTargets] = useState({});
+  const [lastImport, setLastImport] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+
+  const [view, setView] = useState('groups');
+  const [selectedGroup, setSelectedGroup] = useState(null);
+  const [showManage, setShowManage] = useState(false);
+
+  const [groupCash, setGroupCash] = useState('');
+  const [groupMode, setGroupMode] = useState('buy');
+  const [groupResults, setGroupResults] = useState(null);
+
+  const [holdingCash, setHoldingCash] = useState('');
+  const [holdingMode, setHoldingMode] = useState('buy');
+  const [holdingResults, setHoldingResults] = useState(null);
+
+  const [importError, setImportError] = useState('');
+  const fileInputRef = useRef(null);
+
+  useEffect(() => { loadState(); }, []);
+  useEffect(() => { if (loaded) saveState(); /* eslint-disable-next-line */ }, [holdings, groupOverride, groupTargets, holdingTargets, lastImport]);
+
+  async function loadState() {
+    try {
+      const res = await storage.get(STORAGE_KEY, false);
+      if (res && res.value) {
+        const s = JSON.parse(res.value);
+        setHoldings(s.holdings || []);
+        setGroupOverride(s.groupOverride || {});
+        setGroupTargets(s.groupTargets || { 'US Index': 0, 'EX-US Index': 0, 'BOND Index': 0, 'Stocks': 0 });
+        setHoldingTargets(s.holdingTargets || {});
+        setLastImport(s.lastImport || null);
+      }
+    } catch (e) { /* first run, nothing saved yet */ }
+    setLoaded(true);
+  }
+
+  async function saveState() {
+    try {
+      await storage.set(STORAGE_KEY, JSON.stringify({
+        holdings, groupOverride, groupTargets, holdingTargets, lastImport
+      }), false);
+    } catch (e) { /* ignore */ }
+  }
+
+  function resolveGroup(ticker) {
+    return groupOverride[ticker] || DEFAULT_GROUP_RULES[ticker] || 'Stocks';
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImportError('');
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const sheetName = wb.SheetNames.includes('Export') ? 'Export' : wb.SheetNames[0];
+      const ws = wb.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+      if (rows.length < 2) throw new Error('No data rows found.');
+      const header = rows[0].map(h => String(h).trim().toLowerCase());
+      const tickerIdx = header.findIndex(h => h === 'ticker');
+      const nameIdx = header.findIndex(h => h === 'name');
+      const valueIdx = header.findIndex(h => h.includes('market value') && !h.includes('day change'));
+      if (tickerIdx === -1 || valueIdx === -1) throw new Error('Could not find Ticker / Market Value columns.');
+
+      const parsed = [];
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        const ticker = String(row[tickerIdx] || '').trim();
+        const value = parseFloat(row[valueIdx]);
+        if (!ticker || isNaN(value)) continue;
+        parsed.push({ ticker, name: nameIdx !== -1 ? String(row[nameIdx] || '') : '', value });
+      }
+      if (parsed.length === 0) throw new Error('No valid holdings found in the file.');
+
+      setHoldings(parsed);
+      setLastImport(new Date().toLocaleString());
+      setHoldingTargets(prev => {
+        const next = { ...prev };
+        parsed.forEach(p => { if (!(p.ticker in next)) next[p.ticker] = 0; });
+        return next;
+      });
+      setGroupResults(null);
+      setHoldingResults(null);
+    } catch (err) {
+      setImportError(err.message || 'Could not read this file.');
+    }
+    e.target.value = '';
+  }
+
+  const grandTotal = holdings.reduce((s, h) => s + h.value, 0);
+  const groupData = GROUPS.map(g => {
+    const items = holdings.filter(h => resolveGroup(h.ticker) === g);
+    const total = items.reduce((s, h) => s + h.value, 0);
+    return { name: g, items, total, target: groupTargets[g] || 0 };
+  });
+  const groupTargetSum = GROUPS.reduce((s, g) => s + (groupTargets[g] || 0), 0);
+
+  function runGroupCalc() {
+    const cash = parseFloat(groupCash) || 0;
+    const items = groupData.map(g => ({ key: g.name, current: g.total, targetPct: g.target }));
+    setGroupResults(calcRebalance(items, grandTotal, cash, groupMode));
+  }
+
+  function openGroup(name) {
+    setSelectedGroup(name);
+    setView('holdings');
+    setHoldingResults(null);
+    const gr = groupResults && groupResults.find(r => r.key === name);
+    setHoldingCash(gr ? String(Math.round(gr.action)) : '');
+    setHoldingMode(gr && gr.action < 0 ? 'full' : 'buy');
+  }
+
+  const activeGroup = groupData.find(g => g.name === selectedGroup);
+  const holdingTargetSum = activeGroup ? activeGroup.items.reduce((s, h) => s + (holdingTargets[h.ticker] || 0), 0) : 0;
+
+  function runHoldingCalc() {
+    if (!activeGroup) return;
+    const cash = parseFloat(holdingCash) || 0;
+    const items = activeGroup.items.map(h => ({ key: h.ticker, current: h.value, targetPct: holdingTargets[h.ticker] || 0 }));
+    setHoldingResults(calcRebalance(items, activeGroup.total, cash, holdingMode));
+  }
+
+  return (
+    <div style={S.page}>
+      <style>{`
+        input[type=number]::-webkit-inner-spin-button { opacity: 0.4; }
+        input:focus, select:focus { outline: none; border-color: #4fd8c9 !important; }
+      `}</style>
+
+      <p style={S.eyebrow}>Allocation Control</p>
+      <h1 style={S.h1}>Portfolio Rebalancer</h1>
+      <p style={S.sub}>Group-level targets first, then drill into a group to split it across individual holdings. Buy-only or full rebalance with selling — your call.</p>
+
+      <div style={S.panel}>
+        <div style={S.panelTitleRow}>
+          <span style={S.panelTitle}>Import holdings</span>
+          {lastImport && <span style={S.dimMono}>Last imported {lastImport}</span>}
+        </div>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+          <button style={S.btnPrimary} onClick={() => fileInputRef.current.click()}>Import Morningstar .xlsx</button>
+          <input ref={fileInputRef} type="file" accept=".xlsx" style={{ display: 'none' }} onChange={handleFile} />
+          {grandTotal > 0 && <span style={S.dimMono}>{holdings.length} holdings · {fmtMoney(grandTotal)} total</span>}
+        </div>
+        {importError && <p style={{ ...S.warnBanner, marginTop: 10 }}>{importError}</p>}
+        {holdings.length === 0 && <p style={S.emptyState}>No holdings imported yet. Export your portfolio from Morningstar and import the .xlsx file.</p>}
+      </div>
+
+      {holdings.length > 0 && view === 'groups' && (
+        <>
+          <div style={S.panel}>
+            <p style={S.panelTitle}>Groups</p>
+            {Math.abs(groupTargetSum - 100) > 0.5 && (
+              <p style={S.warnBanner}>Group targets sum to {groupTargetSum.toFixed(1)}%, not 100%.</p>
+            )}
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  <th style={S.th}>Group</th>
+                  <th style={S.th}>Current $</th>
+                  <th style={S.th}>Current %</th>
+                  <th style={S.th}>Target %</th>
+                  <th style={S.th}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {groupData.map(g => {
+                  const curPct = grandTotal > 0 ? (g.total / grandTotal * 100) : 0;
+                  const diff = curPct - g.target;
+                  return (
+                    <tr key={g.name} style={S.tr}>
+                      <td style={S.td}><strong>{g.name}</strong><div style={S.dimSmall}>{g.items.length} holding{g.items.length !== 1 ? 's' : ''}</div></td>
+                      <td style={S.td}>{fmtMoney(g.total)}</td>
+                      <td style={S.td}>
+                        {fmtPct(curPct)}
+                        <div style={diffTagStyle(diff)}>{diffLabel(diff)}</div>
+                      </td>
+                      <td style={S.td}>
+                        <input type="number" style={S.inputSm} value={g.target} min="0" max="100" step="0.5"
+                          onChange={e => setGroupTargets(prev => ({ ...prev, [g.name]: parseFloat(e.target.value) || 0 }))} />
+                      </td>
+                      <td style={S.td}><button style={S.btnGhost} onClick={() => openGroup(g.name)}>Drill in →</button></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={S.panel}>
+            <p style={S.panelTitle}>Rebalance groups</p>
+            <div style={S.modeRow}>
+              <label style={S.radioLabel}><input type="radio" checked={groupMode === 'buy'} onChange={() => setGroupMode('buy')} /> Buy only (new cash)</label>
+              <label style={S.radioLabel}><input type="radio" checked={groupMode === 'full'} onChange={() => setGroupMode('full')} /> Full rebalance (buy &amp; sell)</label>
+            </div>
+            <div style={S.investRow}>
+              <div style={S.fieldGroup}>
+                <label style={S.fieldLabel}>{groupMode === 'buy' ? 'Cash to invest' : 'New cash (0 = pure rebalance)'}</label>
+                <input type="number" style={S.inputMd} value={groupCash} placeholder="10000" onChange={e => setGroupCash(e.target.value)} />
+              </div>
+              <button style={S.btnPrimary} onClick={runGroupCalc}>Calculate</button>
+            </div>
+
+            {groupResults && (
+              <table style={{ ...S.table, marginTop: 14 }}>
+                <thead><tr><th style={S.th}>Group</th><th style={S.th}>Action</th><th style={S.th}>New %</th></tr></thead>
+                <tbody>
+                  {groupResults.map(r => {
+                    const cash = parseFloat(groupCash) || 0;
+                    const futureTotal = grandTotal + cash;
+                    const newVal = r.current + r.action;
+                    const newPct = futureTotal > 0 ? (newVal / futureTotal * 100) : 0;
+                    return (
+                      <tr key={r.key} style={S.tr}>
+                        <td style={S.td}><strong>{r.key}</strong></td>
+                        <td style={{ ...S.td, ...actionStyle(r.action) }}>{actionLabel(r.action)}</td>
+                        <td style={S.td}>{fmtPct(newPct)} <span style={S.dimSmall}>(target {fmtPct(r.targetPct)})</span></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+
+      {holdings.length > 0 && view === 'holdings' && activeGroup && (
+        <>
+          <button style={{ ...S.btnGhost, marginBottom: 12 }} onClick={() => setView('groups')}>← Back to groups</button>
+          <div style={S.panel}>
+            <p style={S.panelTitle}>{activeGroup.name} — holdings</p>
+            {Math.abs(holdingTargetSum - 100) > 0.5 && (
+              <p style={S.warnBanner}>Targets within this group sum to {holdingTargetSum.toFixed(1)}%, not 100%.</p>
+            )}
+            <table style={S.table}>
+              <thead>
+                <tr><th style={S.th}>Ticker</th><th style={S.th}>Current $</th><th style={S.th}>Current %</th><th style={S.th}>Target %</th></tr>
+              </thead>
+              <tbody>
+                {activeGroup.items.map(h => {
+                  const curPct = activeGroup.total > 0 ? (h.value / activeGroup.total * 100) : 0;
+                  const target = holdingTargets[h.ticker] || 0;
+                  const diff = curPct - target;
+                  return (
+                    <tr key={h.ticker} style={S.tr}>
+                      <td style={S.td}><strong>{h.ticker}</strong><div style={S.dimSmall}>{h.name}</div></td>
+                      <td style={S.td}>{fmtMoney(h.value)}</td>
+                      <td style={S.td}>{fmtPct(curPct)}<div style={diffTagStyle(diff)}>{diffLabel(diff)}</div></td>
+                      <td style={S.td}>
+                        <input type="number" style={S.inputSm} value={target} min="0" max="100" step="0.5"
+                          onChange={e => setHoldingTargets(prev => ({ ...prev, [h.ticker]: parseFloat(e.target.value) || 0 }))} />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div style={S.panel}>
+            <p style={S.panelTitle}>Rebalance within {activeGroup.name}</p>
+            <div style={S.modeRow}>
+              <label style={S.radioLabel}><input type="radio" checked={holdingMode === 'buy'} onChange={() => setHoldingMode('buy')} /> Buy only (new cash)</label>
+              <label style={S.radioLabel}><input type="radio" checked={holdingMode === 'full'} onChange={() => setHoldingMode('full')} /> Full rebalance (buy &amp; sell)</label>
+            </div>
+            <div style={S.investRow}>
+              <div style={S.fieldGroup}>
+                <label style={S.fieldLabel}>Amount for this group</label>
+                <input type="number" style={S.inputMd} value={holdingCash} placeholder="0" onChange={e => setHoldingCash(e.target.value)} />
+              </div>
+              <button style={S.btnPrimary} onClick={runHoldingCalc}>Calculate</button>
+            </div>
+            <p style={S.dimSmall}>Pre-filled from the group-level result — negative means that group came out overweight and needs net selling. Edit freely.</p>
+
+            {holdingResults && (
+              <table style={{ ...S.table, marginTop: 14 }}>
+                <thead><tr><th style={S.th}>Ticker</th><th style={S.th}>Action</th><th style={S.th}>New %</th></tr></thead>
+                <tbody>
+                  {holdingResults.map(r => {
+                    const cash = parseFloat(holdingCash) || 0;
+                    const futureTotal = activeGroup.total + cash;
+                    const newVal = r.current + r.action;
+                    const newPct = futureTotal > 0 ? (newVal / futureTotal * 100) : 0;
+                    return (
+                      <tr key={r.key} style={S.tr}>
+                        <td style={S.td}><strong>{r.key}</strong></td>
+                        <td style={{ ...S.td, ...actionStyle(r.action) }}>{actionLabel(r.action)}</td>
+                        <td style={S.td}>{fmtPct(newPct)} <span style={S.dimSmall}>(target {fmtPct(r.targetPct)})</span></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </>
+      )}
+
+      {holdings.length > 0 && (
+        <div style={S.panel}>
+          <p style={S.panelTitleRow} onClick={() => setShowManage(!showManage)}>
+            <span style={S.panelTitle}>Manage ticker groups</span>
+            <span style={S.dimMono}>{showManage ? 'hide' : 'show'}</span>
+          </p>
+          {showManage && (
+            <table style={S.table}>
+              <thead><tr><th style={S.th}>Ticker</th><th style={S.th}>Group</th></tr></thead>
+              <tbody>
+                {holdings.map(h => (
+                  <tr key={h.ticker} style={S.tr}>
+                    <td style={S.td}>{h.ticker}</td>
+                    <td style={S.td}>
+                      <select style={S.inputMd} value={resolveGroup(h.ticker)}
+                        onChange={e => setGroupOverride(prev => ({ ...prev, [h.ticker]: e.target.value }))}>
+                        {GROUPS.map(g => <option key={g} value={g}>{g}</option>)}
+                      </select>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      <p style={S.footnote}>Holdings refresh each time you import a new export; group and target settings persist between visits. Nothing here leaves your browser.</p>
+    </div>
+  );
+}
+
+function diffLabel(diff) {
+  if (diff < -0.5) return fmtPct(Math.abs(diff)) + ' under';
+  if (diff > 0.5) return fmtPct(diff) + ' over';
+  return 'on target';
+}
+function diffTagStyle(diff) {
+  const base = { fontFamily: 'var(--mono)', fontSize: 11, padding: '2px 6px', borderRadius: 4, display: 'inline-block', marginTop: 3 };
+  if (diff < -0.5) return { ...base, background: 'rgba(255,180,84,0.15)', color: '#ffb454' };
+  if (diff > 0.5) return { ...base, background: 'rgba(255,107,107,0.15)', color: '#ff6b6b' };
+  return { ...base, background: 'rgba(79,216,201,0.15)', color: '#4fd8c9' };
+}
+function actionLabel(action) {
+  if (action > 0.5) return 'Buy ' + fmtMoney(action);
+  if (action < -0.5) return 'Sell ' + fmtMoney(Math.abs(action));
+  return '—';
+}
+function actionStyle(action) {
+  if (action > 0.5) return { color: '#4fd8c9', fontWeight: 700 };
+  if (action < -0.5) return { color: '#ff6b6b', fontWeight: 700 };
+  return { color: '#8b949e' };
+}
+
+const S = {
+  page: {
+    '--mono': "'SF Mono','JetBrains Mono',Menlo,Consolas,monospace",
+    background: '#0d1117', color: '#e6edf3', fontFamily: '-apple-system,Segoe UI,Roboto,sans-serif',
+    padding: 18, minHeight: '100vh', boxSizing: 'border-box',
+  },
+  eyebrow: { fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.14em', color: '#4fd8c9', textTransform: 'uppercase', margin: '0 0 4px' },
+  h1: { fontSize: 20, fontWeight: 650, margin: '0 0 4px', letterSpacing: '-0.01em' },
+  sub: { fontSize: 13, color: '#8b949e', margin: '0 0 18px', lineHeight: 1.5, maxWidth: '60ch' },
+  panel: { background: '#161b22', border: '1px solid #2a313c', borderRadius: 10, padding: 16, marginBottom: 14 },
+  panelTitleRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '0 0 12px', cursor: 'default' },
+  panelTitle: { fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.1em', color: '#8b949e', textTransform: 'uppercase' },
+  dimMono: { fontFamily: 'var(--mono)', fontSize: 11, color: '#8b949e' },
+  dimSmall: { fontSize: 11, color: '#8b949e', marginTop: 2 },
+  emptyState: { textAlign: 'center', padding: '20px 10px', color: '#8b949e', fontSize: 13 },
+  warnBanner: { fontFamily: 'var(--mono)', fontSize: 12, padding: '8px 10px', borderRadius: 6, background: 'rgba(255,180,84,0.12)', color: '#ffb454', marginBottom: 10 },
+  table: { width: '100%', borderCollapse: 'collapse' },
+  th: { textAlign: 'left', fontFamily: 'var(--mono)', fontSize: 10.5, color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.06em', fontWeight: 500, padding: '0 6px 8px' },
+  td: { padding: '7px 6px', verticalAlign: 'middle', borderTop: '1px solid #2a313c', fontSize: 13 },
+  tr: {},
+  inputSm: { background: '#1c232d', border: '1px solid #2a313c', color: '#e6edf3', borderRadius: 6, padding: '6px 7px', fontFamily: 'var(--mono)', fontSize: 13, width: 70 },
+  inputMd: { background: '#1c232d', border: '1px solid #2a313c', color: '#e6edf3', borderRadius: 6, padding: '7px 9px', fontFamily: 'var(--mono)', fontSize: 13, width: 160 },
+  btnPrimary: { fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: '0.04em', cursor: 'pointer', borderRadius: 6, border: '1px solid #4fd8c9', background: '#4fd8c9', color: '#06231f', fontWeight: 700, padding: '9px 14px' },
+  btnGhost: { fontFamily: 'var(--mono)', fontSize: 12, letterSpacing: '0.04em', cursor: 'pointer', borderRadius: 6, border: '1px solid #2a313c', background: 'transparent', color: '#e6edf3', padding: '7px 12px' },
+  modeRow: { display: 'flex', gap: 18, flexWrap: 'wrap', marginBottom: 12, fontSize: 13 },
+  radioLabel: { display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' },
+  investRow: { display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' },
+  fieldGroup: { display: 'flex', flexDirection: 'column', gap: 4 },
+  fieldLabel: { fontFamily: 'var(--mono)', fontSize: 10.5, color: '#8b949e', textTransform: 'uppercase', letterSpacing: '0.06em' },
+  footnote: { fontSize: 11, color: '#8b949e', marginTop: 4, lineHeight: 1.5 },
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(PortfolioRebalancer));
+
+</script>
+</body>
+</html>
